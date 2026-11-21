@@ -58,34 +58,46 @@
     return [...new Set(list)];
   }
 
-  async function ping(base, timeout = 2200) {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), timeout);
-    try {
-      const res = await fetch(base + "/health", { cache: "no-store", signal: ctrl.signal });
-      if (!res.ok) return null;
-      const data = await res.json();
-      if (data && data.ok) return { base, data };
-      return null;
-    } catch (e) {
-      return null;
-    } finally {
-      clearTimeout(t);
-    }
+  async function ping(base, timeout = 1500) {
+    // 브라우저가 요청을 붙잡고 있어도 우리 타이머가 먼저 끝나도록 race 로 감싼다
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { ctrl.abort(); } catch (e) { /* 무시 */ }
+        resolve(value);
+      };
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => finish(null), timeout);
+      try {
+        fetch(base + "/health", { cache: "no-store", signal: ctrl.signal })
+          .then(async (res) => {
+            if (!res.ok) return finish(null);
+            let data = null;
+            try { data = await res.json(); } catch (e) { data = null; }
+            finish(data && data.ok ? { base, data } : null);
+          })
+          .catch(() => finish(null));
+      } catch (e) {
+        finish(null);
+      }
+    });
   }
 
   async function checkServer(opts = {}) {
     const { quiet } = opts;
     if (!quiet) setStatus("checking", "서버 확인 중…");
-    for (const base of serverCandidates()) {
-      const hit = await ping(base);
-      if (hit) {
-        state.serverUrl = hit.base;
-        const port = hit.data.port || "";
-        setStatus("ok", `서버 연결됨${port ? " · " + port : ""}`);
-        $("notice").hidden = true;
-        return true;
-      }
+    const list = serverCandidates();
+    const hits = await Promise.all(list.map((base) => ping(base)));
+    const hit = hits.find(Boolean) || null;
+    if (hit) {
+      state.serverUrl = hit.base;
+      const port = hit.data.port || "";
+      setStatus("ok", `서버 연결됨${port ? " · " + port : ""}`);
+      $("notice").hidden = true;
+      return true;
     }
     state.serverUrl = null;
     setStatus("off", "서버 꺼짐 · 아래 3단계");
