@@ -146,7 +146,6 @@
     const n = state.images.length;
     $("imgCount").textContent = n + "장";
     $("btnClearImages").hidden = n === 0;
-    $("sceneEmpty").hidden = n > 0;
     $("pgEmpty").hidden = n > 0 || !!state.result;
     $("pgPlay").hidden = n < 1;
     $("resultBadge").hidden = !state.result;
