@@ -30,8 +30,6 @@ import tempfile
 import threading
 import time
 import traceback
-import unicodedata
-import uuid
 import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -52,6 +50,7 @@ MAX_DURATION = 600.0            # 10분
 MIN_SEGMENT = 0.35              # 이미지 한 장 최소 노출(초)
 SUB_BOTTOM = 400                # 자막 하단 여백(px)
 SUB_MAX_WIDTH = 940             # 자막 최대 폭(px)
+MAX_SUBTITLES = 300             # 한 영상에 넣을 자막 토막 최대 수
 
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 
@@ -229,10 +228,6 @@ def parse_srt(text):
 
 # ───────────────────────────── 이미지 합성(Pillow) ─────────────────────────────
 
-def char_width(ch):
-    return 2 if unicodedata.east_asian_width(ch) in ("W", "F", "A") else 1
-
-
 def load_font(size):
     from PIL import ImageFont
     path = resolve_font()
@@ -244,23 +239,7 @@ def load_font(size):
         return None
 
 
-def wrap_subtitle(text, size, max_width=SUB_MAX_WIDTH):
-    """실제 폰트로 폭을 재서 자막을 여러 줄로 나눈다."""
-    font = load_font(size)
-    if font is None:
-        per_line = max(6, int(max_width / (size * 0.98)))
-        out, cur = [], ""
-        words = text.split(" ")
-        for w in words:
-            trial = (cur + " " + w).strip()
-            if len(trial) > per_line and cur:
-                out.append(cur)
-                cur = w
-            else:
-                cur = trial
-        if cur:
-            out.append(cur)
-        return out
+def _wrap_once(text, font, size, max_width):
     out, cur = [], ""
     for ch in text:
         trial = cur + ch
@@ -269,7 +248,7 @@ def wrap_subtitle(text, size, max_width=SUB_MAX_WIDTH):
         except Exception:  # noqa: BLE001
             width = len(trial) * size
         if width > max_width and cur:
-            # 공백이면 공백에서 끊는다
+            # 공백이 있으면 공백에서 끊는다 (영어 단어가 쪼개지지 않게)
             if " " in cur:
                 head, _, tail = cur.rpartition(" ")
                 if tail:
@@ -283,6 +262,48 @@ def wrap_subtitle(text, size, max_width=SUB_MAX_WIDTH):
     if cur:
         out.append(cur)
     return out
+
+
+def wrap_subtitle(text, size, max_width=SUB_MAX_WIDTH):
+    """실제 폰트로 폭을 재서 자막을 여러 줄로 나눈다. 마지막 줄이 외톨이가 되지 않게 균형도 맞춘다."""
+    font = load_font(size)
+    if font is None:
+        per_line = max(6, int(max_width / (size * 0.98)))
+        out, cur = [], ""
+        for w in text.split(" "):
+            trial = (cur + " " + w).strip()
+            if len(trial) > per_line and cur:
+                out.append(cur)
+                cur = w
+            else:
+                cur = trial
+        if cur:
+            out.append(cur)
+        return [l.strip() for l in out if l.strip()]
+
+    lines = _wrap_once(text, font, size, max_width)
+    if len(lines) > 1:
+        try:
+            total = font.getlength(text)
+        except Exception:  # noqa: BLE001
+            total = len(text) * size
+        # 줄 수는 그대로 두고 폭만 줄여 가며 고르게 나누기
+        for factor in (1.08, 1.0, 0.92, 0.84, 0.76):
+            target = min(max_width, total / len(lines) * factor)
+            if target < size * 3:
+                break
+            if target >= max_width:
+                continue
+            alt = _wrap_once(text, font, size, target)
+            if len(alt) == len(lines):
+                def weakness(ls):
+                    try:
+                        return min(font.getlength(x) for x in ls) / max(1.0, max(font.getlength(x) for x in ls))
+                    except Exception:  # noqa: BLE001
+                        return 1.0
+                if weakness(alt) > weakness(lines):
+                    lines = alt
+    return [l.strip() for l in lines if l.strip()]
 
 
 def compose_base(src, dst, style, w, h):
@@ -340,11 +361,34 @@ def compose_base(src, dst, style, w, h):
     canvas.save(dst, "PNG")
 
 
+def render_subtitle_png(lines, size, font_path, dst, w):
+    """자막 한 토막을 글자 띠만큼만 투명 PNG 로 그린다 (굵은 흰 글씨 + 검은 테두리).
+    ffmpeg 의 drawtext/폰트 설정에 기대지 않고, 메모리도 아끼려고 띠 모양으로 그린다.
+    돌려주는 값은 이 PNG 를 붙일 y 위치."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    font = ImageFont.truetype(font_path, size)
+    line_h = int(round(size * 1.30))
+    stroke = max(3, int(round(size * 0.12)))
+    pad = 4
+    total_h = line_h * len(lines)
+    band_h = total_h + 2 * (stroke + pad)
+    img = Image.new("RGBA", (w, band_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    for i, line in enumerate(lines):
+        cy = stroke + pad + i * line_h + line_h // 2
+        draw.text(
+            (w // 2, cy), line, font=font, fill=(255, 255, 255, 255),
+            stroke_width=stroke, stroke_fill=(0, 0, 0, 238), anchor="mm",
+        )
+    img.save(dst, "PNG")
+    return max(0, OUT_H - SUB_BOTTOM - total_h - stroke - pad)
+
+
 # ───────────────────────────── 렌더링 ─────────────────────────────
 
-def build_filter(cues, font_name, sub_size, seg_frames, zoom):
-    """filter_complex 문자열을 만든다. (이미지별 줌 -> 이어붙이기 -> 자막 번인)"""
-    w, h = int(OUT_W * BASE_SCALE), int(OUT_H * BASE_SCALE)
+def build_filter(cues, seg_frames, zoom, sub_input_base):
+    """filter_complex 문자열. 이미지별 줌 -> 이어붙이기 -> 자막 PNG 오버레이."""
     parts = []
     for i, frames in enumerate(seg_frames):
         f = max(2, int(frames))
@@ -367,31 +411,15 @@ def build_filter(cues, font_name, sub_size, seg_frames, zoom):
         parts.append("%sconcat=n=%d:v=1:a=0[vcat]" % (inputs, n))
         last = "vcat"
 
-    chain = []
-    for idx, cue in enumerate(cues):
-        if not cue.get("lines"):
-            continue
-        text_file = "sub_%03d.txt" % idx
-        chain.append(
-            "drawtext=fontfile=%s:textfile=%s:expansion=none:fontsize=%d"
-            ":fontcolor=white:borderw=%d:bordercolor=black@0.94"
-            ":line_spacing=%d:x=(w-text_w)/2:y=h-%d-text_h"
-            ":enable='between(t,%.3f,%.3f)'"
-            % (
-                font_name,
-                text_file,
-                sub_size,
-                max(4, int(round(sub_size * 0.13))),
-                max(4, int(round(sub_size * 0.18))),
-                SUB_BOTTOM + (0 if sub_size <= 64 else (sub_size - 64) * 2),
-                cue["start"],
-                cue["end"],
-            )
+    for k, cue in enumerate(cues):
+        src = "[%s]" % last
+        out = "vs%d" % k
+        parts.append(
+            "%s[%d:v]overlay=0:%d:enable='between(t,%.3f,%.3f)'[%s]"
+            % (src, sub_input_base + k, cue.get("y", OUT_H - SUB_BOTTOM), cue["start"], cue["end"], out)
         )
-    if chain:
-        parts.append("[%s]%s,format=yuv420p[vout]" % (last, ",".join(chain)))
-    else:
-        parts.append("[%s]format=yuv420p[vout]" % last)
+        last = out
+    parts.append("[%s]format=yuv420p[vout]" % last)
     return ";".join(parts)
 
 
@@ -444,32 +472,39 @@ def render_job(images, audio, srt_cues, bgm, opts, work):
     for i, src in enumerate(images):
         compose_base(src, os.path.join(work, "base_%03d.png" % i), style, base_w, base_h)
 
-    # 4) 자막 준비
+    # 4) 자막 준비 — Pillow 로 투명 PNG 를 그려 둔다
+    use_bgm = bool(audio and bgm and bgm_vol > 0)
+    sub_base = n + (1 if audio else 0) + (1 if use_bgm else 0)
     font_path = resolve_font()
-    font_name = "font.ttf"
     cues = []
     if srt_cues and font_path:
-        shutil.copyfile(font_path, os.path.join(work, font_name))
         for cue in srt_cues:
             if cue["start"] >= duration:
                 continue
             lines = wrap_subtitle(cue["text"], sub_size)
             if not lines:
                 continue
-            cue = dict(cue)
-            cue["end"] = min(cue["end"], duration)
-            cue["lines"] = lines
-            cues.append(cue)
-        for idx, cue in enumerate(cues):
-            with open(os.path.join(work, "sub_%03d.txt" % idx), "w", encoding="utf-8") as fh:
-                fh.write("\n".join(cue["lines"]))
+            item = dict(cue)
+            item["end"] = min(item["end"], duration)
+            item["lines"] = lines
+            if item["end"] - item["start"] < 0.15:
+                continue
+            cues.append(item)
+        if len(cues) > MAX_SUBTITLES:
+            cues = cues[:MAX_SUBTITLES]
+        try:
+            for idx, cue in enumerate(cues):
+                cue["y"] = render_subtitle_png(
+                    cue["lines"], sub_size, font_path,
+                    os.path.join(work, "sub_%03d.png" % idx), OUT_W,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log("자막 그림을 만들지 못했습니다 (%s) — 자막 없이 진행합니다." % exc)
+            cues = []
 
     # 5) ffmpeg 실행
-    filter_str = build_filter(cues, font_name, sub_size, seg, zoom)
-    with open(os.path.join(work, "filter.txt"), "w", encoding="utf-8") as fh:
-        fh.write(filter_str)
+    filter_str = build_filter(cues, seg, zoom, sub_base)
 
-    use_bgm = bool(audio and bgm and bgm_vol > 0)
     if use_bgm:
         # 영상 필터와 오디오 믹싱 필터를 하나의 filter_complex 로 합친다
         afilter = (
@@ -489,6 +524,8 @@ def render_job(images, audio, srt_cues, bgm, opts, work):
         cmd += ["-i", os.path.abspath(audio)]
     if use_bgm:
         cmd += ["-stream_loop", "-1", "-i", os.path.abspath(bgm)]
+    for idx in range(len(cues)):
+        cmd += ["-i", "sub_%03d.png" % idx]
     cmd += [filter_file_option(work), "filter.txt", "-map", "[vout]"]
     if use_bgm:
         cmd += ["-map", "[aout]"]
@@ -704,7 +741,7 @@ class Handler(SimpleHTTPRequestHandler):
     def handle_render(self):
         work = tempfile.mkdtemp(prefix="shorts-maker-")
         try:
-            images, audio, srt_path, srt_text, bgm, opts = self.collect(work)
+            images, audio, srt_text, bgm, opts = self.collect(work)
         except RequestError as exc:
             shutil.rmtree(work, ignore_errors=True)
             return self.json_response({"ok": False, "error": str(exc)}, 400)
@@ -863,7 +900,6 @@ class Handler(SimpleHTTPRequestHandler):
         return (
             images,
             audio,
-            None,
             srt_text,
             bgm,
             {

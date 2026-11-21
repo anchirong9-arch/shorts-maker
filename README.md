@@ -48,7 +48,7 @@
 이미지 N장 ──▶ Pillow 로 9:16 캔버스 합성(배경 + 가운데 맞춤)
               ──▶ ffmpeg zoompan 으로 장면별 줌
               ──▶ concat 으로 이어붙이기
-              ──▶ drawtext 로 자막 번인(흰 글씨 + 검은 테두리)
+              ──▶ 자막을 Pillow 로 그린 PNG 로 얹기(흰 글씨 + 검은 테두리)
 음성 + BGM  ──▶ amix 로 볼륨 낮춰 믹싱 ──▶ AAC 192k
                         결과: H.264 / 1080×1920 / 30fps / CRF 20 / faststart
 ```
